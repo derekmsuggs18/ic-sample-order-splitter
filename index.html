@@ -1578,6 +1578,21 @@ GLAZE_TECHNIQUES: ${GLAZE_TECHNIQUES.join(", ")}
 
 PARTS / OTHER SKUs: Anything that is not "SD" or "FSFK" is a "Part" — examples: DDU54 (Door Display Unit), LIT (Literature), ES LIT, TKIT (Tool Kit), KIT, CBSET (Color Block Set), MOLDING SET, PRICE, ACCESSORY, HARDWARE. Extract these normally with their SKU, qty, and itemText. They DO NOT need a doorStyle, species, or finish — leave those blank. They get split into their own orders by SKU. Set isNonDoor=false for these (it's only for items the user wants to manually exclude from the output entirely).
 
+CB (Color Block) — SPECIAL CASE: The bare SKU "CB" is a single-finish color block. The dealer typically writes "CB" + the name of one specific finish (e.g., "CB Ivory", "CB Pacific Sand", "CB White Oak-Natural", "CB White Oak-Cappuccino"). For CB lines:
+- Set sku to "CB"
+- DO populate finishName with the specific paint/stain (e.g., "Ivory", "Buttercream", "Natural", "Dark", "Cappuccino")
+- DO populate finishType ("Paint" or "Stain" or "Translucent Paint")
+- For stains on White Oak (e.g., "White Oak-Natural", "White Oak-Light", "White Oak-Medium", "White Oak-Dark", "White Oak-Cappuccino"), put species: "White Oak" and finishName: the stain (Natural/Light/Medium/Dark/Cappuccino)
+- Leave doorStyle empty
+- The tool routes CB lines into the Paint Parts or Stain Parts bucket based on finishType
+
+QUANTITY MARK-OUTS: Handwritten orders sometimes have crossed-out or scribbled-over quantities (e.g., a "2" with "3" written next to or over it). When you see ANY indication of a markout, correction, or unclear digit in the qty field:
+- Use your best interpretation of the FINAL written value (usually the most recent / clearer mark)
+- Set confidence to "low" for that line
+- Add a note like "qty appears corrected from X to Y — verify"
+- Do NOT concatenate digits (e.g., do NOT read a corrected "2→3" as "23")
+- If the qty is unusually large for a sample order (>10), flag it explicitly in notes
+
 SKUs TO IGNORE COMPLETELY: (none currently)
 
 KIT GROUPING SKUs — SASK: SASK is a "Sample Assortment Kit" — a bundle that contains multiple individual sample doors. When you see "SASK" on a line, look at the surrounding context:
@@ -1821,7 +1836,63 @@ function normalizeLines(rawLines) {
       doorStyle = DOOR_STYLE_ALIASES[aliasKey];
     }
     const rawSpecies = (l.species || '').trim();
-    const normalizedSpecies = normalizeSpeciesForLine(sku, doorStyle, rawSpecies);
+    let normalizedSpecies = normalizeSpeciesForLine(sku, doorStyle, rawSpecies);
+
+    // CB (Color Block) autopopulation: parse itemText to surface species + finish
+    // into their proper fields so the review screen reads cleanly.
+    //
+    // Rules:
+    //   "CB Ivory"                  -> finish=Ivory,    species=Maple (paint default)
+    //   "CB Pacific Sand"           -> finish=Pacific Sand, species=Maple (paint default)
+    //   "CB White Oak-Natural"      -> finish=Natural, species=White Oak
+    //   "CB Cherry-Medium"          -> finish=Medium, species=Cherry
+    //   "CB Hickory Smoke"          -> finish=Smoke, species=Hickory
+    //
+    // The dealer's species comes from the itemText; if it's missing on a stain CB
+    // we leave species blank (the line will then be flagged for review).
+    let cbFinishType = (l.finishType || '').trim();
+    let cbFinishName = (l.finishName || '').trim();
+    if (sku === 'CB' && (!cbFinishName || !normalizedSpecies)) {
+      // Strip the leading "CB " from the itemText so we just have the descriptor
+      const desc = itemText.replace(/^\s*CB\s+/i, '').trim();
+      // Try to recognize "Species-Finish" or "Species Finish" patterns first.
+      // Species names with spaces (White Oak, Knotty Hickory, Rift White Oak,
+      // Rift Red Oak) need to match before single-word species so the longer
+      // names take precedence.
+      const speciesList = [
+        'Knotty Hickory', 'Rift White Oak', 'Rift Red Oak',
+        'White Oak', 'Maple', 'Cherry', 'Hickory', 'Oak', 'MDF'
+      ];
+      let speciesMatch = '', finishPart = '';
+      for (const sp of speciesList) {
+        // Allow "White Oak-Natural", "White Oak Natural", "WhiteOak-Natural"
+        const re = new RegExp(`^${sp.replace(/\s+/g, '\\s*')}\\s*[- ]\\s*(.+)$`, 'i');
+        const m = desc.match(re);
+        if (m) { speciesMatch = sp; finishPart = m[1].trim(); break; }
+      }
+
+      if (speciesMatch) {
+        // Stain-style CB: explicit species in the text. Set species and finish.
+        if (!normalizedSpecies) normalizedSpecies = speciesMatch;
+        if (!cbFinishName) cbFinishName = finishPart;
+      } else if (desc) {
+        // Paint-style CB: no species in the text, the descriptor IS the finish.
+        if (!cbFinishName) cbFinishName = desc;
+      }
+
+      // Now, if we still don't have finishType, infer it from the finish name
+      // and use it to default species for paint CBs to Maple.
+      if (cbFinishName && !cbFinishType) {
+        if (PAINT_FINISHES.includes(cbFinishName)) cbFinishType = 'Paint';
+        else if (STAIN_FINISHES.includes(cbFinishName)) cbFinishType = 'Stain';
+        else if (TRANSLUCENT_FINISHES.includes(cbFinishName)) cbFinishType = 'Translucent Paint';
+      }
+      // Default species: paint CBs assume Maple (most common substrate for paint).
+      // Stain CBs require an explicit species — if missing, leave blank to flag.
+      if (!normalizedSpecies && (cbFinishType === 'Paint' || cbFinishType === 'Translucent Paint')) {
+        normalizedSpecies = 'Maple';
+      }
+    }
     return {
       id: 'L' + idx,
       qty: parseInt(l.qty, 10) || 1,
@@ -1831,8 +1902,8 @@ function normalizeLines(rawLines) {
       doorStyleVariant: variantInfo.variant,
       fsfkFrameType: fsfkInfo.frame,
       species: normalizedSpecies,
-      finishType: (l.finishType || '').trim(),
-      finishName: (l.finishName || '').trim(),
+      finishType: cbFinishType,
+      finishName: cbFinishName,
       glazeColor: (l.glazeColor || '').trim(),
       glazeTechnique: (l.glazeTechnique || '').trim(),
       finishProcess: (l.finishProcess || '').trim(),
@@ -1913,6 +1984,13 @@ function getFlagReasons(line) {
   if (!sku) {
     reasons.push('Missing SKU — pick SD, FSFK, or a Part SKU like DDU54, LIT, etc.');
   }
+  // Quantity sanity check — sample orders very rarely need >10 of anything.
+  // Common cause: handwritten markouts where "2" got crossed out and "3" written
+  // beside it, accidentally captured as "23". Flag for visual verification.
+  const qty = parseInt(line.qty, 10) || 0;
+  if (qty > 10) {
+    reasons.push(`Quantity is ${qty} — that's unusually high for a sample order. Double-check the original (could be a corrected mark-out like "2→3" read as "23")`);
+  }
   if (!isPart) {
     if (!line.species) reasons.push('Missing Species — pick from the dropdown (this is a splitter)');
     if (!line.finishName) reasons.push('Missing Finish — pick from the dropdown (this is a splitter)');
@@ -1956,6 +2034,9 @@ function getFlagFields(line) {
     fields.add('doorStyle'); fields.add('species'); fields.add('finish');
   }
   if (!sku) fields.add('sku');
+  // Highlight qty cell when quantity looks suspiciously high (markout suspect)
+  const qty = parseInt(line.qty, 10) || 0;
+  if (qty > 10) fields.add('qty');
   if (!isPart) {
     if (!line.species) fields.add('species');
     if (!line.finishName) fields.add('finish');
@@ -2007,6 +2088,11 @@ function renderLineTable() {
     const isFsfk = sku === 'FSFK';
     const isSd = sku === 'SD';
     const isPart = !isFsfk && !isSd;
+    // CB (Color Block) is technically a Part SKU but it has a real species + finish
+    // associated with it, so we render those fields editable while keeping door
+    // style / finish process N/A. Other Parts (LIT, TKIT, DDU54, etc.) get the full
+    // N/A placeholder.
+    const isCb = sku === 'CB';
 
     // Show "—" for door/species/finish/process on Part lines (those don't apply)
     const partPlaceholder = '<span class="small" style="color:var(--muted)">N/A — Part</span>';
@@ -2036,12 +2122,12 @@ function renderLineTable() {
     tr.innerHTML = `
       <td>${i + 1}${flagBadge ? '<br>' + flagBadge : ''}</td>
       <td${cellCls('sku')}>${line.isNonDoor ? '—' : renderSkuSelect(line, i)}</td>
-      <td class="qty"><input type="number" min="1" value="${line.qty}" data-f="qty" /></td>
+      <td class="qty${flagFields.has('qty') ? ' flag-cell' : ''}"><input type="number" min="1" value="${line.qty}" data-f="qty" /></td>
       <td><textarea data-f="itemText" rows="2" style="resize:vertical; min-height:36px;">${escapeHtml(line.itemText)}</textarea></td>
       <td>${line.isNonDoor ? '—' : (isFsfk ? renderFrameTypeSelect(line, i) : '<span class="small" style="color:var(--muted)">—</span>')}</td>
       <td${cellCls('doorStyle')}>${line.isNonDoor ? '—' : (isPart ? partPlaceholder : renderDoorStyleSelect(line, i, isFsfk))}</td>
-      <td${cellCls('species')}>${line.isNonDoor ? '—' : (isPart ? partPlaceholder : renderSpeciesSelect(line, i))}</td>
-      <td${cellCls('finish')}>${line.isNonDoor ? '—' : (isPart ? partPlaceholder : renderFinishSelect(line, i))}</td>
+      <td${cellCls('species')}>${line.isNonDoor ? '—' : ((isPart && !isCb) ? partPlaceholder : renderSpeciesSelect(line, i))}</td>
+      <td${cellCls('finish')}>${line.isNonDoor ? '—' : ((isPart && !isCb) ? partPlaceholder : renderFinishSelect(line, i))}</td>
       <td>${line.isNonDoor ? '—' : (isPart ? partPlaceholder : renderFinishProcessSelect(line, i))}</td>
       <td><textarea data-f="modifications" rows="2" style="resize:vertical; min-height:36px;">${escapeHtml(line.modifications)}</textarea></td>
       <td>${priceCell}</td>
@@ -2250,7 +2336,7 @@ function onLineFieldChange(e) {
   // others remain. This is what makes the visual feedback feel responsive:
   // pick a valid value → orange goes away from that cell immediately.
   const flagFields = nowFlag ? getFlagFields(line) : new Set();
-  const fieldToCellIndex = { sku: 1, doorStyle: 5, species: 6, finish: 7 };
+  const fieldToCellIndex = { sku: 1, qty: 2, doorStyle: 5, species: 6, finish: 7 };
   for (const [field, ci] of Object.entries(fieldToCellIndex)) {
     const td = tr.children[ci];
     if (!td) continue;
@@ -2553,6 +2639,7 @@ function splitOrders(lines) {
 
   const isFsfk = (l) => (l.sku || '').toUpperCase() === 'FSFK';
   const isSd   = (l) => (l.sku || '').toUpperCase() === 'SD';
+  const isCb   = (l) => (l.sku || '').toUpperCase() === 'CB';
 
   // Classify each Part SKU into one of three buckets:
   //   'paint' — color block sets that are paint-only (CBBOX, CBSET, CBSET-M, CBSET-PNT)
@@ -2560,17 +2647,28 @@ function splitOrders(lines) {
   //   'general' — everything else (LIT, TKIT, DDU54, PRICE, ES LIT, etc.)
   // CBSETs split between paint and stain buckets so they ship with the right finish category.
   // Other Parts collapse onto a single generic Parts order.
+  //
+  // Note: Bare "CB" (single Color Block) is handled separately AFTER initial splitting
+  // — see the CB ride-along pass below. CBs do NOT go through the partBucket path.
   const PAINT_PART_SKUS = new Set(['CBBOX', 'CBSET', 'CBSET-M', 'CBSET-PNT']);
   const STAIN_PART_SKUS = new Set(['CBSET-C', 'CBSET-H', 'CBSET-O', 'CBSET-WO', 'CBSET-STN']);
-  const partBucket = (sku) => {
-    const s = (sku || '').toUpperCase().trim();
-    if (PAINT_PART_SKUS.has(s)) return 'paint';
-    if (STAIN_PART_SKUS.has(s)) return 'stain';
+  const partBucket = (line) => {
+    const sku = ((typeof line === 'string' ? line : line.sku) || '').toUpperCase().trim();
+    if (PAINT_PART_SKUS.has(sku)) return 'paint';
+    if (STAIN_PART_SKUS.has(sku)) return 'stain';
     return 'general';
   };
 
+  // Split key for SD/FSFK lines AND for CB lines that are looking for a home.
+  // CBs use the SD key shape so a CB "Maple Paint" line matches an SD "Maple Paint"
+  // group with the same glaze/finish process — same shape, same content.
+  const skuKindForKey = (l) => {
+    if (isFsfk(l)) return 'FSFK';
+    if (isSd(l) || isCb(l)) return 'SD';   // CB rides on SD by treating it as SD for keying
+    return null;
+  };
+
   const keyOf = (l) => {
-    const sku = (l.sku || '').toUpperCase();
     const species = (l.species || '').trim().toLowerCase();
     const cat = finishCategoryOf(l).toLowerCase();
     const glazeTech = (l.glazeTechnique || '').trim().toLowerCase();
@@ -2581,18 +2679,27 @@ function splitOrders(lines) {
     if (isFsfk(l)) {
       return `FSFK::${species}::${cat}::${glazeTech}::${glazeColor}::${finishProc}`;
     }
-    if (isSd(l)) {
-      const isolated = isolationSet.has(ds.toLowerCase());
+    if (isSd(l) || isCb(l)) {
+      // CBs never have a door style, so they can't be on the isolation path —
+      // only SD lines with Atlantis/Aruba/Salem hit the isolation key.
+      const isolated = isSd(l) && isolationSet.has(ds.toLowerCase());
       return isolated
         ? `SD-ISO::${ds.toLowerCase()}::${species}::${cat}::${glazeTech}::${glazeColor}::${finishProc}`
         : `SD::${species}::${cat}::${glazeTech}::${glazeColor}::${finishProc}`;
     }
-    // Parts: split by bucket — paint CBSETs, stain CBSETs, or general
-    return `PART::${partBucket(sku)}`;
+    // Other Parts: split by bucket — paint CBSETs, stain CBSETs, or general
+    return `PART::${partBucket(l)}`;
   };
 
+  // PASS 1: bucket every NON-CB line first. SDs find their groups, FSFKs find theirs,
+  // Parts find theirs. We hold CBs aside so they can ride along on matching SD groups.
   const map = new Map();
+  const cbLines = [];
   for (const l of lines) {
+    if (isCb(l)) {
+      cbLines.push(l);
+      continue;
+    }
     const k = keyOf(l);
     if (!map.has(k)) {
       const sku = (l.sku || '').toUpperCase();
@@ -2605,21 +2712,63 @@ function splitOrders(lines) {
         key: k,
         skuType: fsfk ? 'FSFK' : (sd ? 'SD' : 'PART'),
         partSku: null,
-        partBucket: isPart ? partBucket(sku) : null,
+        partBucket: isPart ? partBucket(l) : null,
         species: l.species,
         finishCategory: finishCategoryOf(l),
         glazeTechnique: l.glazeTechnique || '',
         glazeColor: l.glazeColor || '',
         finishProcess: l.finishProcess || '',
         isolatedDoorStyle: isolated ? ds : null,
-        lines: []
+        lines: [],
+        cbLines: []   // ride-along CB lines, rendered as a separate "Color Blocks" subsection
       });
     }
     map.get(k).lines.push(l);
   }
 
-  // Sort: SD first (isolation styles first), then FSFK, then the single Parts order.
-  const typeRank = { SD: 0, FSFK: 1, PART: 2 };
+  // PASS 2: try to attach each CB to a matching SD group. The CB's split key is
+  // computed using the SD shape, so it matches when species + finish category +
+  // glaze technique + glaze color + finish process all align. If a match exists
+  // AND that match is an SD group (not a Part bucket), the CB rides along.
+  const orphanCbs = [];
+  for (const cb of cbLines) {
+    const k = keyOf(cb);
+    const existing = map.get(k);
+    if (existing && existing.skuType === 'SD') {
+      existing.cbLines.push(cb);
+    } else {
+      orphanCbs.push(cb);
+    }
+  }
+
+  // PASS 3: orphan CBs (no matching SD) get their own SD-shaped groups so they
+  // split by Species + Finish category + Glaze + Finish process — same rules as
+  // SDs, but the group skuType is "SD-CB" so the renderer knows it's CB-only.
+  for (const cb of orphanCbs) {
+    const k = keyOf(cb);  // same shape as SD key
+    if (!map.has(k)) {
+      map.set(k, {
+        key: k,
+        skuType: 'SD-CB',                 // distinct so renderer/filename/title can label it
+        partSku: null,
+        partBucket: null,
+        species: cb.species,
+        finishCategory: finishCategoryOf(cb),
+        glazeTechnique: cb.glazeTechnique || '',
+        glazeColor: cb.glazeColor || '',
+        finishProcess: cb.finishProcess || '',
+        isolatedDoorStyle: null,
+        lines: [],
+        cbLines: []
+      });
+    }
+    // Orphan CBs become the only content of their group — but we still keep them
+    // in cbLines (not lines) so the renderer treats them as Color Blocks.
+    map.get(k).cbLines.push(cb);
+  }
+
+  // Sort: SD first (isolation styles first), then SD-CB (CB-only orders), then FSFK, then Parts.
+  const typeRank = { SD: 0, 'SD-CB': 1, FSFK: 2, PART: 3 };
   return [...map.values()].sort((a, b) => {
     if (typeRank[a.skuType] !== typeRank[b.skuType]) return typeRank[a.skuType] - typeRank[b.skuType];
     if (a.skuType === 'SD') {
@@ -2655,7 +2804,10 @@ function renderSuborders(groups) {
   document.getElementById('grandTotal').textContent = fmtMoney(grandTotal);
 
   groups.forEach((g, i) => {
-    const totalQty = g.lines.reduce((s, l) => s + (l.qty || 1), 0);
+    // Total piece count and price include both regular lines and ride-along CB lines
+    const allLines = [...(g.lines || []), ...(g.cbLines || [])];
+    const totalQty = allLines.reduce((s, l) => s + (l.qty || 1), 0);
+    const cbCount = (g.cbLines || []).length;
     let headerLabel;
     let tagColor = 'var(--accent-dark)';
     let tagText = '';
@@ -2681,23 +2833,29 @@ function renderSuborders(groups) {
         headerLabel = `FSFK · ${baseLabel}`;
         tagColor = '#2d7a3e';
         tagText = 'FSFK';
+      } else if (g.skuType === 'SD-CB') {
+        // Orphan CB-only order: no SD partner found, CBs go on their own.
+        headerLabel = `Color Blocks · ${baseLabel}`;
+        tagColor = '#5a4ec2';
+        tagText = 'COLOR BLOCKS';
       } else if (g.isolatedDoorStyle) {
         headerLabel = `SD · ${g.isolatedDoorStyle} · ${baseLabel}`;
-        tagText = 'isolated style';
+        tagText = cbCount > 0 ? `isolated style · +${cbCount} CB` : 'isolated style';
       } else {
         headerLabel = `SD · ${baseLabel}`;
+        if (cbCount > 0) tagText = `+${cbCount} CB`;
       }
     }
 
     const distinctStyles = [...new Set(g.lines.map(l => l.doorStyle).filter(Boolean))];
     const styleCount = distinctStyles.length;
-    const distinctFinishes = [...new Set(g.lines.map(l => l.finishName).filter(Boolean))];
+    const distinctFinishes = [...new Set(allLines.map(l => l.finishName).filter(Boolean))];
     const finishCount = distinctFinishes.length;
 
-    // Compute order total
+    // Compute order total — include ride-along CBs
     let orderTotal = 0;
     let unpriceableCount = 0;
-    g.lines.forEach(l => {
+    allLines.forEach(l => {
       const p = priceLine(l);
       if (p.found) orderTotal += p.extPrice;
       else unpriceableCount++;
@@ -2709,7 +2867,7 @@ function renderSuborders(groups) {
 
     const detailsLine = g.skuType === 'PART'
       ? `${g.lines.length} line(s) · ${totalQty} piece(s)`
-      : `${g.lines.length} line(s) · ${totalQty} piece(s) · ${styleCount} door style${styleCount === 1 ? '' : 's'} · ${finishCount} finish${finishCount === 1 ? '' : 'es'}`;
+      : `${allLines.length} line(s) · ${totalQty} piece(s) · ${styleCount} door style${styleCount === 1 ? '' : 's'} · ${finishCount} finish${finishCount === 1 ? '' : 'es'}`;
 
     const totalLine = orderTotal > 0
       ? `<div style="font-family:'Helvetica Neue',sans-serif; font-size:14px; font-weight:700; color:var(--accent-dark); margin-top:4px;">Order Total: ${fmtMoney(orderTotal)}${unpriceableCount > 0 ? ` <span style="font-weight:400; font-size:11px; color:var(--warn);">(+ ${unpriceableCount} unpriced)</span>` : ''}</div>`
@@ -2808,6 +2966,20 @@ function generatePdfForGroup(group, orderNum, totalOrders) {
     if (group.partBucket === 'paint') descParts = ['Parts Paint'];
     else if (group.partBucket === 'stain') descParts = ['Parts Stain'];
     else descParts = ['Parts'];
+  } else if (group.skuType === 'SD-CB') {
+    // Orphan CB-only orders — prefix with "CB" to distinguish from SD orders
+    descParts = ['CB'];
+    descParts.push(meaningful(group.species));
+    descParts.push(meaningful(group.finishCategory));
+    if (meaningful(group.glazeTechnique)) {
+      const tech = meaningful(group.glazeTechnique);
+      const techShort = tech === 'Hand Wipe' ? 'HW' : tech;
+      descParts.push(techShort);
+      if (meaningful(group.glazeColor)) descParts.push(meaningful(group.glazeColor));
+    } else if (meaningful(group.glazeColor)) {
+      descParts.push(meaningful(group.glazeColor));
+    }
+    if (meaningful(group.finishProcess)) descParts.push(meaningful(group.finishProcess));
   } else {
     descParts = [group.skuType];
     if (group.isolatedDoorStyle) descParts.push(group.isolatedDoorStyle);
@@ -2823,6 +2995,8 @@ function generatePdfForGroup(group, orderNum, totalOrders) {
       descParts.push(meaningful(group.glazeColor));
     }
     if (meaningful(group.finishProcess)) descParts.push(meaningful(group.finishProcess));
+    // SD orders that have CB ride-alongs get a "+CB" suffix in the filename
+    if ((group.cbLines || []).length > 0) descParts.push('+CB');
   }
   const desc = descParts.filter(Boolean).join(' ');
 
@@ -2953,12 +3127,18 @@ function renderFormIntoPdf(doc, group, orderNum, totalOrders) {
     if (glazeColor) glazeBits.push(glazeColor.toUpperCase());
     const glazeSuffix = glazeBits.length ? ` · GLAZE: ${glazeBits.join(' ')}` : '';
     const procSuffix = finishProc ? ` · ${finishProc.toUpperCase()}` : '';
+    // CB count badge for SD orders that have ride-alongs — surfaces the fact
+    // that this order is "doors plus color blocks" right in the banner.
+    const cbCount = (group.cbLines || []).length;
+    const cbSuffix = cbCount > 0 ? ` (+${cbCount} CB)` : '';
     if (group.skuType === 'FSFK') {
       headerText = `FSFK SAMPLE ORDER · ${group.species.toUpperCase()} · ${group.finishCategory.toUpperCase()}${glazeSuffix}${procSuffix}`;
+    } else if (group.skuType === 'SD-CB') {
+      headerText = `COLOR BLOCKS ORDER · ${group.species.toUpperCase()} · ${group.finishCategory.toUpperCase()}${glazeSuffix}${procSuffix}`;
     } else if (group.isolatedDoorStyle) {
-      headerText = `SD SAMPLE ORDER · ${group.isolatedDoorStyle.toUpperCase()} · ${group.species.toUpperCase()} · ${group.finishCategory.toUpperCase()}${glazeSuffix}${procSuffix}`;
+      headerText = `SD SAMPLE ORDER · ${group.isolatedDoorStyle.toUpperCase()} · ${group.species.toUpperCase()} · ${group.finishCategory.toUpperCase()}${glazeSuffix}${procSuffix}${cbSuffix}`;
     } else {
-      headerText = `SD SAMPLE ORDER · ${group.species.toUpperCase()} · ${group.finishCategory.toUpperCase()}${glazeSuffix}${procSuffix}`;
+      headerText = `SD SAMPLE ORDER · ${group.species.toUpperCase()} · ${group.finishCategory.toUpperCase()}${glazeSuffix}${procSuffix}${cbSuffix}`;
     }
   }
   doc.text(headerText, PAGE_W/2, y + 11, { align: 'center' });
@@ -2980,6 +3160,20 @@ function renderFormIntoPdf(doc, group, orderNum, totalOrders) {
       speciesSpec = '—';
       finishSpec = '—';
     }
+  } else if (group.skuType === 'SD-CB') {
+    // Orphan Color Blocks — no SD partner exists for this species + finish combo.
+    doorStyleSpec = 'Color Blocks';
+    speciesSpec = group.species;
+    const finishParts = [group.finishCategory];
+    const sGlazeTech = meaningful(group.glazeTechnique);
+    const sGlazeColor = meaningful(group.glazeColor);
+    const sFinishProc = meaningful(group.finishProcess);
+    const glazeBits = [];
+    if (sGlazeTech) glazeBits.push(sGlazeTech);
+    if (sGlazeColor) glazeBits.push(sGlazeColor);
+    if (glazeBits.length) finishParts.push('Glaze: ' + glazeBits.join(' '));
+    if (sFinishProc) finishParts.push(sFinishProc);
+    finishSpec = finishParts.join(' / ');
   } else {
     if (group.skuType === 'FSFK') {
       // FSFK: if all lines share one style, show it; else "Sample Front Kit Mix"
@@ -3063,7 +3257,7 @@ function renderFormIntoPdf(doc, group, orderNum, totalOrders) {
   // This is purely for readability of the printed form. The underlying group.lines order
   // is unchanged elsewhere — we only sort the array we iterate here.
   // Empty/missing values sort to the end so anything weird stands out at the bottom.
-  const sortedLines = [...group.lines].sort((a, b) => {
+  const sortFn = (a, b) => {
     const styleA = (a.doorStyle || '').trim().toLowerCase();
     const styleB = (b.doorStyle || '').trim().toLowerCase();
     if (styleA && !styleB) return -1;
@@ -3074,11 +3268,27 @@ function renderFormIntoPdf(doc, group, orderNum, totalOrders) {
     if (finA && !finB) return -1;
     if (!finA && finB) return 1;
     return finA.localeCompare(finB);
-  });
+  };
+  const sortedRegularLines = [...(group.lines || [])].sort(sortFn);
+  const sortedCbLines = [...(group.cbLines || [])].sort(sortFn);
 
-  sortedLines.forEach((line, idx) => {
-    if (y + ROW_H > PAGE_H - MARGIN - 20) {
-      // new page with slim header
+  // Build a unified render list. CB ride-along lines get a sentinel header row
+  // inserted between them and the regular lines so the PDF gets a "COLOR BLOCKS"
+  // subheader band. For SD-CB orders (orphan CB-only) there's no regular section
+  // and no subheader — the whole order IS color blocks.
+  const renderItems = [];
+  for (const l of sortedRegularLines) renderItems.push({ kind: 'row', line: l });
+  if (sortedCbLines.length > 0 && sortedRegularLines.length > 0) {
+    renderItems.push({ kind: 'cb-subheader' });
+  }
+  for (const l of sortedCbLines) renderItems.push({ kind: 'row', line: l });
+
+  let lineNumber = 0;
+  renderItems.forEach((item) => {
+    // Page-break check — be a bit more conservative for the subheader so we don't
+    // orphan it at the bottom of a page.
+    const needed = item.kind === 'cb-subheader' ? 18 + ROW_H : ROW_H;
+    if (y + needed > PAGE_H - MARGIN - 20) {
       doc.addPage();
       y = MARGIN;
       doc.setFont('helvetica','bold'); doc.setFontSize(10);
@@ -3087,6 +3297,8 @@ function renderFormIntoPdf(doc, group, orderNum, totalOrders) {
         if (group.partBucket === 'paint') contLabel = `Parts Order — Paint (cont.)`;
         else if (group.partBucket === 'stain') contLabel = `Parts Order — Stain (cont.)`;
         else contLabel = `Parts Order — (cont.)`;
+      } else if (group.skuType === 'SD-CB') {
+        contLabel = `Color Blocks · ${group.species} · ${group.finishCategory} — (cont.)`;
       } else if (group.isolatedDoorStyle) {
         contLabel = `${group.isolatedDoorStyle} · ${group.species} · ${group.finishCategory} — (cont.)`;
       } else {
@@ -3096,6 +3308,25 @@ function renderFormIntoPdf(doc, group, orderNum, totalOrders) {
       y += 18;
       doc.setFont('helvetica','normal'); doc.setFontSize(9);
     }
+
+    // CB subheader band — a single styled row that visually separates color blocks
+    // from regular sample doors on the same order.
+    if (item.kind === 'cb-subheader') {
+      const totalW = cols.reduce((s, c) => s + c.w, 0);
+      doc.setFillColor(232, 226, 210);
+      doc.rect(MARGIN, y, totalW, 18, 'F');
+      doc.rect(MARGIN, y, totalW, 18);
+      doc.setFont('helvetica','bold'); doc.setFontSize(10);
+      doc.setTextColor(0, 0, 0);
+      doc.text('COLOR BLOCKS', MARGIN + 6, y + 12);
+      doc.setFont('helvetica','normal'); doc.setFontSize(9);
+      y += 18;
+      return;
+    }
+
+    // Regular row
+    const line = item.line;
+    lineNumber += 1;
     let x = MARGIN;
     const finishCellText = [line.finishName, line.glazeColor, line.glazeTechnique]
       .map(v => meaningful(v))
@@ -3105,7 +3336,6 @@ function renderFormIntoPdf(doc, group, orderNum, totalOrders) {
     let doorStyleCell = isFsfkLine && line.fsfkFrameType
       ? `${line.fsfkFrameType}-${line.doorStyle}`
       : line.doorStyle || '';
-    // Append the RR variant if set (e.g., "Bella RR" or "B-Vicksburg RR")
     if (line.doorStyleVariant) {
       doorStyleCell = doorStyleCell
         ? `${doorStyleCell} ${line.doorStyleVariant}`
@@ -3117,7 +3347,7 @@ function renderFormIntoPdf(doc, group, orderNum, totalOrders) {
       let maxLines = 2;
       let textAlign = 'left';
       let boldFirstLine = false;
-      if (ci === 0) text = String(idx + 1);
+      if (ci === 0) text = String(lineNumber);
       else if (ci === 1) text = String(line.qty || 1);
       else if (ci === 2) {
         // For Part SKUs (anything other than SD/FSFK), the door/species/finish
@@ -3172,10 +3402,12 @@ function renderFormIntoPdf(doc, group, orderNum, totalOrders) {
     y += ROW_H;
   });
 
-  // Add TOTAL row spanning the right side
+  // Add TOTAL row spanning the right side. Total includes both regular lines
+  // and any CB ride-along lines.
   let orderTotal = 0;
   let unpriceableCount = 0;
-  group.lines.forEach(l => {
+  const allLinesForTotal = [...(group.lines || []), ...(group.cbLines || [])];
+  allLinesForTotal.forEach(l => {
     const p = priceLine(l);
     if (p.found) orderTotal += p.extPrice;
     else unpriceableCount++;
@@ -3206,9 +3438,13 @@ function renderFormIntoPdf(doc, group, orderNum, totalOrders) {
     y += ROW_H;
   }
 
-  // fill remaining rows up to 16 per page like the original form, so it feels like a real form
+  // fill remaining rows up to 16 per page like the original form, so it feels like a real form.
+  // Used rows include regular lines + CB ride-alongs + the CB subheader (if any).
   const minRows = 15;
-  const usedRows = group.lines.length;
+  const cbCount = (group.cbLines || []).length;
+  const regCount = (group.lines || []).length;
+  const subheaderRows = (cbCount > 0 && regCount > 0) ? 1 : 0;
+  const usedRows = regCount + cbCount + subheaderRows;
   for (let r = usedRows; r < minRows; r++) {
     if (y + ROW_H > PAGE_H - MARGIN - 20) break;
     let x = MARGIN;
