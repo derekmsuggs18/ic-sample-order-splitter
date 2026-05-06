@@ -654,6 +654,7 @@
             <th style="width:140px">Species *</th>
             <th style="width:220px">Finish *</th>
             <th style="width:120px">Finish Process *</th>
+            <th style="width:110px">Drawer Front *<br><span style="font-weight:400; font-size:9px">(SFK/FSFK only)</span></th>
             <th style="width:160px">Modifications</th>
             <th style="width:100px">Ext List $</th>
             <th style="width:65px">Controls</th>
@@ -662,7 +663,7 @@
         <tbody id="lineTableBody"></tbody>
       </table>
     </div>
-    <div class="small" style="margin-top:6px">* = splitting field. SD, FSFK, and Parts each go on separate orders. Within SD/FSFK, unique combos of Species + Finish category + Glaze + Finish process split. Atlantis, Aruba &amp; Salem (SD only) get their own orders. Parts split into three buckets: Paint Color Blocks (CBBOX, CBSET, CBSET-M, CBSET-PNT), Stain Color Blocks (CBSET-C, CBSET-H, CBSET-O, CBSET-WO, CBSET-STN), and general Parts (LIT, TKIT, etc.). <strong>Drag the bottom scrollbar to see all columns.</strong></div>
+    <div class="small" style="margin-top:6px">* = splitting field. SD, SFK, FSFK, and Parts each go on separate orders. Within SD/SFK/FSFK, unique combos of Species + Finish category + Glaze + Finish process split. SFK and FSFK additionally split by Drawer Front type (Slab vs 5PC). Atlantis, Aruba &amp; Salem (SD/SFK) get their own orders. Parts split into three buckets: Paint Color Blocks (CBBOX, CBSET, CBSET-M, CBSET-PNT), Stain Color Blocks (CBSET-C, CBSET-H, CBSET-O, CBSET-WO, CBSET-STN), and general Parts (LIT, TKIT, etc.). CB lines ride along on matching SD/SFK orders when species + finish + glaze + finish process all match. <strong>Drag the bottom scrollbar to see all columns.</strong></div>
 
     <div style="margin-top:20px; display:flex; gap:12px; align-items:center;">
       <button class="secondary" id="addLineBtn">+ Add Line</button>
@@ -761,6 +762,19 @@ const ISOLATION_DOOR_STYLES = ["Atlantis", "Aruba", "Salem"];
 // Door styles that require species normalization: "Rift White Oak" -> "White Oak",
 // "Rift Red Oak" -> "Oak". These styles never use the rift designation.
 const RIFT_NORMALIZE_DOOR_STYLES = ["Atlantis", "Aruba", "Salem"];
+
+// Field-feedback rule: For Atlantis, Nassau, and Aruba, paint samples are MDF
+// only — the tool's rules table technically allows Maple, but in practice these
+// three doors only get painted on MDF substrate. Reps frequently send these in
+// as Maple by mistake, so we coerce silently AND flag the change so the operator
+// can verify. Stains on these doors don't get coerced (stains can't go on MDF
+// at all, which is its own validation rule).
+//
+// Format: { doorStyleLowercase: { paintCoerceTo: 'MDF', stainCoerceTo: null } }
+// Add more entries here as new field-feedback patterns emerge.
+const PAINT_MDF_ONLY_DOOR_STYLES = new Set([
+  'atlantis', 'nassau', 'aruba'
+]);
 
 // Aliases: when the AI or a user types one of these, normalize to the canonical name.
 // Lookup is case-insensitive. Add new aliases here as they show up in real orders.
@@ -1358,7 +1372,7 @@ async function parseExcelOrderForm(file) {
     // dealer left the comment blank — and even then we flag the line for review.
     const parsed = parseCommentText(comments);
 
-    const isSdOrFsfk = sku.toUpperCase() === 'SD' || sku.toUpperCase() === 'FSFK';
+    const isSdOrFsfk = sku.toUpperCase() === 'SD' || sku.toUpperCase() === 'SFK' || sku.toUpperCase() === 'FSFK';
     const hasAnyParsed = parsed.doorStyle || parsed.species || parsed.finishName;
 
     let lineDoorStyle, lineSpecies, lineFinish, lineFinishType;
@@ -1407,6 +1421,7 @@ async function parseExcelOrderForm(file) {
       glazeColor: parsed.glazeColor || header.headerGlazeColor || '',
       glazeTechnique: parsed.glazeTechnique || header.headerGlazeTechnique || '',
       finishProcess: parsed.finishProcess || header.headerFinishProcess || '',
+      drawerFrontType: parsed.drawerFrontType || '',
       modifications: '',
       hinge: cellVal(`D${row}`),
       finishedEnds: '',
@@ -1494,9 +1509,23 @@ function parseCommentText(text) {
     }
   }
 
+  // Detect drawer front type — only meaningful for SFK/FSFK.
+  // Recognized phrases (case-insensitive): "5 PC HEAD", "5PC HEAD", "5 PC", "5PC",
+  // "5-PIECE", "5 PIECE", "FIVE PIECE" → "5PC". "SLAB HEAD", "SLAB" → "Slab".
+  // The caller decides whether this is meaningful based on SKU type.
+  let drawerFrontType = '';
+  // 5PC checks first because "5 PC HEAD" contains nothing that could match "Slab"
+  if (/\b5\s*PC\s*HEAD\b/i.test(text) || /\b5\s*PC\b/i.test(text) ||
+      /\b5[\s-]*PIECE\b/i.test(text) || /\bFIVE\s*PIECE\b/i.test(text)) {
+    drawerFrontType = '5PC';
+  } else if (/\bSLAB\s*HEAD\b/i.test(text) || /\bSLAB\b/i.test(text)) {
+    drawerFrontType = 'Slab';
+  }
+
   return {
     doorStyle, species, finishName, finishType,
-    glazeColor: '', glazeTechnique: '', finishProcess: '', variant
+    glazeColor: '', glazeTechnique: '', finishProcess: '', variant,
+    drawerFrontType
   };
 }
 
@@ -1566,9 +1595,22 @@ DOOR_STYLES: ${DOOR_STYLES.join(", ")}
 
 SPECIES (canonical forms): Oak, Maple, Cherry, Knotty Hickory, Hickory, White Oak, Rift White Oak, Rift Red Oak, MDF. Accept abbreviations: KH=Knotty Hickory, RO=Red Oak=Oak, WO=White Oak, M=Maple, C=Cherry, H=Hickory.
 
-IMPORTANT SPECIES NORMALIZATION RULE: For SD (Sample Door) lines, "Rift White Oak" / "Rift Cut White Oak" must be output as "White Oak", and "Rift Red Oak" / "Rift Cut Red Oak" must be output as "Oak". Rift cut species are only legitimate on FSFK lines. For FSFK lines, preserve "Rift White Oak" and "Rift Red Oak" as-is. The Atlantis, Aruba, and Salem door styles ALSO get normalized (their species is never Rift), regardless of SKU.
+IMPORTANT SPECIES NORMALIZATION RULE: For SD (Sample Door) and SFK (Sample Front Kit) lines, "Rift White Oak" / "Rift Cut White Oak" must be output as "White Oak", and "Rift Red Oak" / "Rift Cut Red Oak" must be output as "Oak". Rift cut species are only legitimate on FSFK lines. For FSFK lines, preserve "Rift White Oak" and "Rift Red Oak" as-is. The Atlantis, Aruba, and Salem door styles ALSO get normalized (their species is never Rift), regardless of SKU.
 
 DOOR STYLE VARIANT: If you see "RR" appended to a door style (e.g., "Bella FO RR", "Hathaway RR"), this means "Reversed Raised". Strip "RR" off the doorStyle field and put "RR" in the "doorStyleVariant" field. Example: "Bella FO RR" → doorStyle: "Bella FO", doorStyleVariant: "RR". RR does NOT split orders; it's per-line info for production.
+
+THREE TYPES OF SAMPLE-CABINET-PRODUCT SKUs you'll see:
+- "SD" — Sample Door. Just a door. Needs doorStyle, species, finish.
+- "SFK" — Sample Front Kit. A door + drawer-front kit. Same fields as SD.
+- "FSFK" — Full-Size Sample Front Kit. Same fields as SD.
+
+SFK is NOT the same as FSFK — they are distinct products. Don't confuse them. SFKs sometimes have descriptors like "SLAB HEAD" or "5 PC HEAD" in their comments — these describe the drawer-front style for that kit. Capture them in the itemText as written but don't try to put them in the doorStyle field.
+
+DRAWER FRONT TYPE (SFK and FSFK ONLY): SFK and FSFK kits ship with a drawer front, and the dealer specifies which kind. Two valid values:
+- "Slab" — flat slab drawer front. Phrases like "SLAB", "SLAB HEAD", "SLAB DF" all mean Slab.
+- "5PC" — 5-piece (mitered) drawer front. Phrases like "5 PC HEAD", "5PC HEAD", "5 PC", "5PC", "5-PIECE", "FIVE PIECE" all mean 5PC.
+
+Populate the "drawerFrontType" field with EXACTLY "Slab" or "5PC" for SFK and FSFK lines. If the comment doesn't mention drawer front type at all on an SFK/FSFK line, default to "Slab" (it's the most common). For SD lines and Part lines (LIT, TKIT, CB, CBSET, etc.), leave drawerFrontType empty — they don't ship with a drawer front.
 
 STAIN_FINISHES: ${STAIN_FINISHES.join(", ")}
 PAINT_FINISHES: ${PAINT_FINISHES.join(", ")}
@@ -1576,7 +1618,7 @@ TRANSLUCENT_FINISHES: ${TRANSLUCENT_FINISHES.join(", ")}
 GLAZE_COLORS: ${GLAZE_COLORS.join(", ")}
 GLAZE_TECHNIQUES: ${GLAZE_TECHNIQUES.join(", ")}
 
-PARTS / OTHER SKUs: Anything that is not "SD" or "FSFK" is a "Part" — examples: DDU54 (Door Display Unit), LIT (Literature), ES LIT, TKIT (Tool Kit), KIT, CBSET (Color Block Set), MOLDING SET, PRICE, ACCESSORY, HARDWARE. Extract these normally with their SKU, qty, and itemText. They DO NOT need a doorStyle, species, or finish — leave those blank. They get split into their own orders by SKU. Set isNonDoor=false for these (it's only for items the user wants to manually exclude from the output entirely).
+PARTS / OTHER SKUs: Anything that is not "SD", "SFK", or "FSFK" is a "Part" — examples: DDU54 (Door Display Unit), LIT (Literature), ES LIT, TKIT (Tool Kit), KIT, CBSET (Color Block Set), MOLDING SET, PRICE, ACCESSORY, HARDWARE. Extract these normally with their SKU, qty, and itemText. They DO NOT need a doorStyle, species, or finish — leave those blank. They get split into their own orders by SKU. Set isNonDoor=false for these (it's only for items the user wants to manually exclude from the output entirely).
 
 CB (Color Block) — SPECIAL CASE: The bare SKU "CB" is a single-finish color block. The dealer typically writes "CB" + the name of one specific finish (e.g., "CB Ivory", "CB Pacific Sand", "CB White Oak-Natural", "CB White Oak-Cappuccino"). For CB lines:
 - Set sku to "CB"
@@ -1666,6 +1708,7 @@ Output ONLY valid JSON. No markdown, no prose, no code fences. Exactly this stru
       "glazeColor": "",
       "glazeTechnique": "",
       "finishProcess": "",
+      "drawerFrontType": "",
       "modifications": "",
       "hinge": "",
       "finishedEnds": "",
@@ -1754,9 +1797,9 @@ Output ONLY valid JSON. No markdown, no prose, no code fences. Exactly this stru
 function normalizeLines(rawLines) {
   const riftNormSet = new Set(RIFT_NORMALIZE_DOOR_STYLES.map(s => s.toLowerCase()));
 
-  // Rift normalization: applies to all SD lines (rift cut not legitimate on SDs),
-  // plus the always-isolated styles (Atlantis/Aruba/Salem) regardless of SKU.
-  // FSFK lines keep Rift species as-is.
+  // Rift normalization: applies to all SD and SFK lines (rift cut not legitimate
+  // on these, only on FSFK), plus the always-isolated styles (Atlantis/Aruba/Salem)
+  // regardless of SKU. FSFK lines keep Rift species as-is.
   const normalizeSpeciesForLine = (sku, doorStyle, species) => {
     if (!species) return species;
     const lower = species.trim().toLowerCase();
@@ -1767,9 +1810,9 @@ function normalizeLines(rawLines) {
     const skuUp = (sku || '').toUpperCase();
     const ds = (doorStyle || '').trim().toLowerCase();
     const isIsolatedStyle = riftNormSet.has(ds);
-    const isSd = skuUp === 'SD';
+    const isSdOrSfk = skuUp === 'SD' || skuUp === 'SFK';
 
-    if (isSd || isIsolatedStyle) {
+    if (isSdOrSfk || isIsolatedStyle) {
       return isRiftWO ? 'White Oak' : 'Oak';
     }
     return species;
@@ -1893,6 +1936,26 @@ function normalizeLines(rawLines) {
         normalizedSpecies = 'Maple';
       }
     }
+
+    // Field-feedback rule: Atlantis, Nassau, and Aruba on PAINT samples must
+    // be MDF — reps frequently send these in as Maple by mistake. We coerce
+    // silently — no note, no flag. The downstream door×species×finish validator
+    // is no longer triggered because the species is corrected before it runs.
+    // Rule applies to SD and SFK. Stains on these doors are left alone (they'll
+    // be caught by the regular validation rules if the species is wrong).
+    {
+      const skuUp = sku.toUpperCase();
+      const isSdLike = skuUp === 'SD' || skuUp === 'SFK';
+      const dsLower = (doorStyle || '').toLowerCase();
+      const finishCat = cbFinishType || (l.finishType || '').trim();
+      const isPaint = /paint/i.test(finishCat) || PAINT_FINISHES.includes(cbFinishName) ||
+                      TRANSLUCENT_FINISHES.includes(cbFinishName);
+      if (isSdLike && PAINT_MDF_ONLY_DOOR_STYLES.has(dsLower) && isPaint &&
+          normalizedSpecies && normalizedSpecies.toLowerCase() !== 'mdf') {
+        normalizedSpecies = 'MDF';
+      }
+    }
+
     return {
       id: 'L' + idx,
       qty: parseInt(l.qty, 10) || 1,
@@ -1907,6 +1970,21 @@ function normalizeLines(rawLines) {
       glazeColor: (l.glazeColor || '').trim(),
       glazeTechnique: (l.glazeTechnique || '').trim(),
       finishProcess: (l.finishProcess || '').trim(),
+      // Drawer front type: 'Slab' or '5PC'. Only meaningful for SFK and FSFK
+      // (they ship with a drawer front). For SD/Part/CB lines this stays empty.
+      // Default for SFK/FSFK with empty value is 'Slab' (most common).
+      drawerFrontType: (() => {
+        const skuUp = (l.sku || '').toUpperCase();
+        const needsDF = skuUp === 'SFK' || skuUp === 'FSFK';
+        if (!needsDF) return '';
+        const v = (l.drawerFrontType || '').trim();
+        if (v === 'Slab' || v === '5PC') return v;
+        // Tolerant matching: "5 PC" / "slab" / "SLAB HEAD" / etc.
+        const u = v.toUpperCase();
+        if (/5\s*PC|5\s*PIECE/.test(u)) return '5PC';
+        if (/SLAB/.test(u)) return 'Slab';
+        return 'Slab';   // default per business rule
+      })(),
       modifications: (l.modifications || '').trim(),
       hinge: (l.hinge || '').trim(),
       finishedEnds: (l.finishedEnds || '').trim(),
@@ -1950,7 +2028,7 @@ function prefillReviewScreen(extracted) {
     if (l.isNonDoor) return;
     if (l.approved) return;  // operator manually approved this line — never flag
     const sku = (l.sku || '').toUpperCase();
-    const isPart = sku && sku !== 'SD' && sku !== 'FSFK';
+    const isPart = sku && sku !== 'SD' && sku !== 'SFK' && sku !== 'FSFK';
     if (l.confidence === 'low') state.flags.add(i);
     // Parts only need a SKU. SD/FSFK need species + finish.
     if (!sku) state.flags.add(i);
@@ -1973,7 +2051,7 @@ function getFlagReasons(line) {
   if (line.isNonDoor) return reasons;  // skipped lines aren't flagged
   if (line.approved) return reasons;   // operator approved — bypass
   const sku = (line.sku || '').toUpperCase();
-  const isPart = sku && sku !== 'SD' && sku !== 'FSFK';
+  const isPart = sku && sku !== 'SD' && sku !== 'SFK' && sku !== 'FSFK';
   // Surface conflicts from Excel parsing first — they're the most actionable
   if (line.notes) {
     reasons.push(line.notes);
@@ -2027,7 +2105,7 @@ function getFlagFields(line) {
   if (line.isNonDoor) return fields;
   if (line.approved) return fields;
   const sku = (line.sku || '').toUpperCase();
-  const isPart = sku && sku !== 'SD' && sku !== 'FSFK';
+  const isPart = sku && sku !== 'SD' && sku !== 'SFK' && sku !== 'FSFK';
   // If we have an explicit fallback or AI uncertainty note, highlight all the
   // splitting fields since any of them could be wrong.
   if (line.notes || (line.confidence === 'low' && !line.notes)) {
@@ -2087,7 +2165,11 @@ function renderLineTable() {
     const sku = (line.sku || '').toUpperCase();
     const isFsfk = sku === 'FSFK';
     const isSd = sku === 'SD';
-    const isPart = !isFsfk && !isSd;
+    const isSfk = sku === 'SFK';
+    // Sample doors, sample front kits, full-size sample front kits all need
+    // door style + species + finish. Everything else is a "Part" with N/A
+    // placeholders, except for CB which has its own special handling.
+    const isPart = !isFsfk && !isSd && !isSfk;
     // CB (Color Block) is technically a Part SKU but it has a real species + finish
     // associated with it, so we render those fields editable while keeping door
     // style / finish process N/A. Other Parts (LIT, TKIT, DDU54, etc.) get the full
@@ -2129,6 +2211,7 @@ function renderLineTable() {
       <td${cellCls('species')}>${line.isNonDoor ? '—' : ((isPart && !isCb) ? partPlaceholder : renderSpeciesSelect(line, i))}</td>
       <td${cellCls('finish')}>${line.isNonDoor ? '—' : ((isPart && !isCb) ? partPlaceholder : renderFinishSelect(line, i))}</td>
       <td>${line.isNonDoor ? '—' : (isPart ? partPlaceholder : renderFinishProcessSelect(line, i))}</td>
+      <td>${line.isNonDoor ? '—' : ((isFsfk || isSfk) ? renderDrawerFrontSelect(line, i) : '<span class="small" style="color:var(--muted)">—</span>')}</td>
       <td><textarea data-f="modifications" rows="2" style="resize:vertical; min-height:36px;">${escapeHtml(line.modifications)}</textarea></td>
       <td>${priceCell}</td>
       <td class="controls">
@@ -2158,12 +2241,23 @@ function renderFinishProcessSelect(line, i) {
   return `<select data-f="finishProcess">${options}</select>`;
 }
 
+// SFK and FSFK split by drawer front type — Slab vs 5PC. Default to Slab when
+// the dealer didn't specify (per business rule).
+function renderDrawerFrontSelect(line, i) {
+  const current = (line.drawerFrontType || 'Slab');
+  const options = [
+    { code: 'Slab', label: 'Slab' },
+    { code: '5PC', label: '5PC (5-Piece)' }
+  ].map(p => `<option value="${p.code}" ${p.code === current ? 'selected' : ''}>${p.label}</option>`).join('');
+  return `<select data-f="drawerFrontType">${options}</select>`;
+}
+
 function renderSkuSelect(line, i) {
   // SKU is a free-text input with autocomplete suggestions.
-  // Common values: SD, FSFK, plus the known part SKUs.
+  // Common values: SD, SFK, FSFK, plus the known part SKUs.
   const sku = (line.sku || '').toUpperCase();
   const datalistId = `skuList_${i}`;
-  const suggestions = ['SD', 'FSFK', ...NON_DOOR_SKUS];
+  const suggestions = ['SD', 'SFK', 'FSFK', ...NON_DOOR_SKUS];
   const options = suggestions.map(s => `<option value="${s}">`).join('');
   return `<input type="text" data-f="sku" value="${escapeHtml(sku)}" list="${datalistId}" style="text-transform:uppercase;" />
     <datalist id="${datalistId}">${options}</datalist>`;
@@ -2273,9 +2367,11 @@ function onLineFieldChange(e) {
     line.sku = (e.target.value || '').toUpperCase().trim();
     const isFsfkNow = line.sku === 'FSFK';
     const isSdNow = line.sku === 'SD';
-    const isPartNow = !isFsfkNow && !isSdNow;
+    const isSfkNow = line.sku === 'SFK';
+    const isCbNow = line.sku === 'CB';
+    const isPartNow = !isFsfkNow && !isSdNow && !isSfkNow && !isCbNow;
     if (isPartNow) {
-      // Parts don't have door/species/finish/process — clear them
+      // Generic Parts (LIT, TKIT, etc.) — clear all door/finish fields
       line.doorStyle = '';
       line.species = '';
       line.finishType = '';
@@ -2284,14 +2380,26 @@ function onLineFieldChange(e) {
       line.glazeTechnique = '';
       line.finishProcess = '';
       line.fsfkFrameType = '';
+      line.drawerFrontType = '';
+    } else if (isCbNow) {
+      // CB: keep species/finish, clear door style and drawer-front-related fields
+      line.doorStyle = '';
+      line.fsfkFrameType = '';
+      line.drawerFrontType = '';
     } else {
-      // SD or FSFK: validate door style still applies for the chosen SKU type
+      // SD, SFK, or FSFK: validate door style still applies for the chosen SKU type
       const validStyles = isFsfkNow ? ELITE_DOOR_STYLES : DOOR_STYLES;
       if (line.doorStyle && !validStyles.includes(line.doorStyle)) {
         line.doorStyle = '';
       }
-      if (!isFsfkNow) {
-        line.fsfkFrameType = '';
+      // Frame type only applies to FSFK
+      if (!isFsfkNow) line.fsfkFrameType = '';
+      // Drawer front type applies to SFK and FSFK; default to Slab if empty;
+      // clear it for SD lines
+      if (isSfkNow || isFsfkNow) {
+        if (!line.drawerFrontType) line.drawerFrontType = 'Slab';
+      } else {
+        line.drawerFrontType = '';
       }
     }
     // Full re-render needed since column visibility changes
@@ -2374,7 +2482,7 @@ function onLineAction(e) {
       if (l.isNonDoor) return;
       if (l.approved) return;
       const sku = (l.sku || '').toUpperCase();
-      const isPart = sku && sku !== 'SD' && sku !== 'FSFK';
+      const isPart = sku && sku !== 'SD' && sku !== 'SFK' && sku !== 'FSFK';
       if (!sku) state.flags.add(i);
       if (!isPart && (!l.species || !l.finishName)) state.flags.add(i);
       if (!isPart && l.doorStyle && !DOOR_STYLES.includes(l.doorStyle)) state.flags.add(i);
@@ -2394,7 +2502,7 @@ function onLineAction(e) {
       const l = state.lines[idx];
       if (!l.isNonDoor) {
         const sku = (l.sku || '').toUpperCase();
-        const isPart = sku && sku !== 'SD' && sku !== 'FSFK';
+        const isPart = sku && sku !== 'SD' && sku !== 'SFK' && sku !== 'FSFK';
         let shouldFlag = false;
         if (l.confidence === 'low') shouldFlag = true;
         if (!sku) shouldFlag = true;
@@ -2423,7 +2531,7 @@ document.getElementById('addLineBtn').addEventListener('click', () => {
     id: 'L' + state.lines.length,
     qty: 1, sku: 'SD', itemText: '', doorStyle: '', doorStyleVariant: '', species: '',
     finishType: '', finishName: '', glazeColor: '', glazeTechnique: '',
-    finishProcess: '',
+    finishProcess: '', drawerFrontType: '',
     modifications: '', hinge: '', finishedEnds: '', isNonDoor: false, approved: false,
     confidence: 'high', notes: ''
   });
@@ -2568,7 +2676,7 @@ document.getElementById('generateBtn').addEventListener('click', () => {
   const invalid = activeLines.filter(l => {
     const sku = (l.sku || '').toUpperCase();
     if (!sku) return true;
-    const isPart = sku !== 'SD' && sku !== 'FSFK';
+    const isPart = sku !== 'SD' && sku !== 'SFK' && sku !== 'FSFK';
     if (isPart) return false;
     return !l.species || !l.finishName;
   });
@@ -2586,7 +2694,7 @@ document.getElementById('generateBtn').addEventListener('click', () => {
   }
   const missingStyle = activeLines.filter(l => {
     const sku = (l.sku || '').toUpperCase();
-    return (sku === 'SD' || sku === 'FSFK') && !l.doorStyle;
+    return (sku === 'SD' || sku === 'SFK' || sku === 'FSFK') && !l.doorStyle;
   }).length;
   if (missingStyle > 0) {
     if (!confirm(`${missingStyle} SD/FSFK line(s) have no Door Style filled in. They will still be split correctly, but the door style will be blank on the output form. Continue?`)) {
@@ -2639,6 +2747,7 @@ function splitOrders(lines) {
 
   const isFsfk = (l) => (l.sku || '').toUpperCase() === 'FSFK';
   const isSd   = (l) => (l.sku || '').toUpperCase() === 'SD';
+  const isSfk  = (l) => (l.sku || '').toUpperCase() === 'SFK';
   const isCb   = (l) => (l.sku || '').toUpperCase() === 'CB';
 
   // Classify each Part SKU into one of three buckets:
@@ -2659,15 +2768,6 @@ function splitOrders(lines) {
     return 'general';
   };
 
-  // Split key for SD/FSFK lines AND for CB lines that are looking for a home.
-  // CBs use the SD key shape so a CB "Maple Paint" line matches an SD "Maple Paint"
-  // group with the same glaze/finish process — same shape, same content.
-  const skuKindForKey = (l) => {
-    if (isFsfk(l)) return 'FSFK';
-    if (isSd(l) || isCb(l)) return 'SD';   // CB rides on SD by treating it as SD for keying
-    return null;
-  };
-
   const keyOf = (l) => {
     const species = (l.species || '').trim().toLowerCase();
     const cat = finishCategoryOf(l).toLowerCase();
@@ -2675,9 +2775,21 @@ function splitOrders(lines) {
     const glazeColor = (l.glazeColor || '').trim().toLowerCase();
     const finishProc = (l.finishProcess || '').trim().toLowerCase();
     const ds = (l.doorStyle || '').trim();
+    // Drawer front type ('Slab' / '5PC') is a splitting axis for SFK and FSFK
+    // only — different drawer front types ship as separate orders.
+    const df = (l.drawerFrontType || '').trim().toLowerCase();
 
     if (isFsfk(l)) {
-      return `FSFK::${species}::${cat}::${glazeTech}::${glazeColor}::${finishProc}`;
+      return `FSFK::${species}::${cat}::${glazeTech}::${glazeColor}::${finishProc}::${df}`;
+    }
+    if (isSfk(l)) {
+      // SFK (Sample Front Kit) follows the same splitting rules as SD plus
+      // the drawer-front-type axis. Isolation styles (Atlantis, Aruba, Salem)
+      // get their own SFK orders too.
+      const isolated = isolationSet.has(ds.toLowerCase());
+      return isolated
+        ? `SFK-ISO::${ds.toLowerCase()}::${species}::${cat}::${glazeTech}::${glazeColor}::${finishProc}::${df}`
+        : `SFK::${species}::${cat}::${glazeTech}::${glazeColor}::${finishProc}::${df}`;
     }
     if (isSd(l) || isCb(l)) {
       // CBs never have a door style, so they can't be on the isolation path —
@@ -2691,8 +2803,9 @@ function splitOrders(lines) {
     return `PART::${partBucket(l)}`;
   };
 
-  // PASS 1: bucket every NON-CB line first. SDs find their groups, FSFKs find theirs,
-  // Parts find theirs. We hold CBs aside so they can ride along on matching SD groups.
+  // PASS 1: bucket every NON-CB line first. SDs find their groups, SFKs theirs,
+  // FSFKs theirs, Parts theirs. We hold CBs aside so they can ride along on
+  // matching SD groups in pass 2.
   const map = new Map();
   const cbLines = [];
   for (const l of lines) {
@@ -2706,11 +2819,14 @@ function splitOrders(lines) {
       const ds = (l.doorStyle || '').trim();
       const fsfk = isFsfk(l);
       const sd = isSd(l);
-      const isPart = !fsfk && !sd;
-      const isolated = sd && isolationSet.has(ds.toLowerCase());
+      const sfk = isSfk(l);
+      const isPart = !fsfk && !sd && !sfk;
+      // Isolation only applies to SD and SFK — FSFK never isolates.
+      const isolated = (sd || sfk) && isolationSet.has(ds.toLowerCase());
+      const skuType = fsfk ? 'FSFK' : (sd ? 'SD' : (sfk ? 'SFK' : 'PART'));
       map.set(k, {
         key: k,
-        skuType: fsfk ? 'FSFK' : (sd ? 'SD' : 'PART'),
+        skuType,
         partSku: null,
         partBucket: isPart ? partBucket(l) : null,
         species: l.species,
@@ -2718,6 +2834,9 @@ function splitOrders(lines) {
         glazeTechnique: l.glazeTechnique || '',
         glazeColor: l.glazeColor || '',
         finishProcess: l.finishProcess || '',
+        // Surface drawer front type at the group level for SFK/FSFK so
+        // renderers can label and the filename can include it.
+        drawerFrontType: (sfk || fsfk) ? (l.drawerFrontType || 'Slab') : '',
         isolatedDoorStyle: isolated ? ds : null,
         lines: [],
         cbLines: []   // ride-along CB lines, rendered as a separate "Color Blocks" subsection
@@ -2726,16 +2845,31 @@ function splitOrders(lines) {
     map.get(k).lines.push(l);
   }
 
-  // PASS 2: try to attach each CB to a matching SD group. The CB's split key is
-  // computed using the SD shape, so it matches when species + finish category +
-  // glaze technique + glaze color + finish process all align. If a match exists
-  // AND that match is an SD group (not a Part bucket), the CB rides along.
+  // PASS 2: try to attach each CB to a matching SD or SFK group. CBs match
+  // exactly on Species + Finish category + Glaze technique + Glaze color +
+  // Finish process. The CB itself doesn't have a SKU-type prefix, so we compute
+  // BOTH the SD-shaped key and the SFK-shaped key and check each — preferring
+  // an SD match over an SFK match if both exist (since SDs are typically the
+  // "primary" sample item on an order).
+  //
+  // Note: CBs never have a door style, so they never trigger isolation. They
+  // can only ride along on a non-isolated SD/SFK group.
   const orphanCbs = [];
   for (const cb of cbLines) {
-    const k = keyOf(cb);
-    const existing = map.get(k);
-    if (existing && existing.skuType === 'SD') {
-      existing.cbLines.push(cb);
+    const species = (cb.species || '').trim().toLowerCase();
+    const cat = finishCategoryOf(cb).toLowerCase();
+    const glazeTech = (cb.glazeTechnique || '').trim().toLowerCase();
+    const glazeColor = (cb.glazeColor || '').trim().toLowerCase();
+    const finishProc = (cb.finishProcess || '').trim().toLowerCase();
+    const sdKey = `SD::${species}::${cat}::${glazeTech}::${glazeColor}::${finishProc}`;
+    const sfkKey = `SFK::${species}::${cat}::${glazeTech}::${glazeColor}::${finishProc}`;
+
+    const sdMatch = map.get(sdKey);
+    const sfkMatch = map.get(sfkKey);
+    if (sdMatch && sdMatch.skuType === 'SD') {
+      sdMatch.cbLines.push(cb);
+    } else if (sfkMatch && sfkMatch.skuType === 'SFK') {
+      sfkMatch.cbLines.push(cb);
     } else {
       orphanCbs.push(cb);
     }
@@ -2767,11 +2901,12 @@ function splitOrders(lines) {
     map.get(k).cbLines.push(cb);
   }
 
-  // Sort: SD first (isolation styles first), then SD-CB (CB-only orders), then FSFK, then Parts.
-  const typeRank = { SD: 0, 'SD-CB': 1, FSFK: 2, PART: 3 };
+  // Sort: SD (isolation first), then SD-CB orphan CBs, then SFK (isolation first),
+  // then FSFK, then Parts.
+  const typeRank = { SD: 0, 'SD-CB': 1, SFK: 2, FSFK: 3, PART: 4 };
   return [...map.values()].sort((a, b) => {
     if (typeRank[a.skuType] !== typeRank[b.skuType]) return typeRank[a.skuType] - typeRank[b.skuType];
-    if (a.skuType === 'SD') {
+    if (a.skuType === 'SD' || a.skuType === 'SFK') {
       const aIso = a.isolatedDoorStyle ? 0 : 1;
       const bIso = b.isolatedDoorStyle ? 0 : 1;
       if (aIso !== bIso) return aIso - bIso;
@@ -2827,12 +2962,24 @@ function renderSuborders(groups) {
       if (g.glazeColor) glazeBits.push(g.glazeColor);
       const glazeSuffix = glazeBits.length ? ` · Glaze: ${glazeBits.join(' ')}` : '';
       const procSuffix = g.finishProcess ? ` · ${g.finishProcess}` : '';
+      // Drawer front suffix — only meaningful for SFK and FSFK
+      const dfSuffix = g.drawerFrontType ? ` · ${g.drawerFrontType} DF` : '';
       const baseLabel = `${g.species} · ${g.finishCategory}${glazeSuffix}${procSuffix}`;
 
       if (g.skuType === 'FSFK') {
-        headerLabel = `FSFK · ${baseLabel}`;
+        headerLabel = `FSFK · ${baseLabel}${dfSuffix}`;
         tagColor = '#2d7a3e';
         tagText = 'FSFK';
+      } else if (g.skuType === 'SFK') {
+        // Sample Front Kit — separate product from FSFK but same splitting shape as SD.
+        if (g.isolatedDoorStyle) {
+          headerLabel = `SFK · ${g.isolatedDoorStyle} · ${baseLabel}${dfSuffix}`;
+          tagText = cbCount > 0 ? `SFK · isolated · +${cbCount} CB` : 'SFK · isolated style';
+        } else {
+          headerLabel = `SFK · ${baseLabel}${dfSuffix}`;
+          tagText = cbCount > 0 ? `SFK · +${cbCount} CB` : 'SFK';
+        }
+        tagColor = '#3a6b9a';   // muted blue, distinct from SD/FSFK/PART
       } else if (g.skuType === 'SD-CB') {
         // Orphan CB-only order: no SD partner found, CBs go on their own.
         headerLabel = `Color Blocks · ${baseLabel}`;
@@ -2995,7 +3142,10 @@ function generatePdfForGroup(group, orderNum, totalOrders) {
       descParts.push(meaningful(group.glazeColor));
     }
     if (meaningful(group.finishProcess)) descParts.push(meaningful(group.finishProcess));
-    // SD orders that have CB ride-alongs get a "+CB" suffix in the filename
+    // Drawer front type for SFK/FSFK — distinguishes "SFK Hickory Stain Slab" from
+    // "SFK Hickory Stain 5PC" in the filename
+    if (group.drawerFrontType) descParts.push(group.drawerFrontType + ' DF');
+    // SD/SFK orders that have CB ride-alongs get a "+CB" suffix in the filename
     if ((group.cbLines || []).length > 0) descParts.push('+CB');
   }
   const desc = descParts.filter(Boolean).join(' ');
@@ -3127,12 +3277,20 @@ function renderFormIntoPdf(doc, group, orderNum, totalOrders) {
     if (glazeColor) glazeBits.push(glazeColor.toUpperCase());
     const glazeSuffix = glazeBits.length ? ` · GLAZE: ${glazeBits.join(' ')}` : '';
     const procSuffix = finishProc ? ` · ${finishProc.toUpperCase()}` : '';
-    // CB count badge for SD orders that have ride-alongs — surfaces the fact
+    // CB count badge for SD/SFK orders that have ride-alongs — surfaces the fact
     // that this order is "doors plus color blocks" right in the banner.
     const cbCount = (group.cbLines || []).length;
     const cbSuffix = cbCount > 0 ? ` (+${cbCount} CB)` : '';
+    // Drawer front type — only for SFK and FSFK
+    const dfSuffix = group.drawerFrontType ? ` · ${group.drawerFrontType.toUpperCase()} DF` : '';
     if (group.skuType === 'FSFK') {
-      headerText = `FSFK SAMPLE ORDER · ${group.species.toUpperCase()} · ${group.finishCategory.toUpperCase()}${glazeSuffix}${procSuffix}`;
+      headerText = `FSFK SAMPLE ORDER · ${group.species.toUpperCase()} · ${group.finishCategory.toUpperCase()}${glazeSuffix}${procSuffix}${dfSuffix}`;
+    } else if (group.skuType === 'SFK') {
+      // Sample Front Kit — distinct from FSFK
+      const sfkPrefix = group.isolatedDoorStyle
+        ? `SFK SAMPLE ORDER · ${group.isolatedDoorStyle.toUpperCase()}`
+        : `SFK SAMPLE ORDER`;
+      headerText = `${sfkPrefix} · ${group.species.toUpperCase()} · ${group.finishCategory.toUpperCase()}${glazeSuffix}${procSuffix}${dfSuffix}${cbSuffix}`;
     } else if (group.skuType === 'SD-CB') {
       headerText = `COLOR BLOCKS ORDER · ${group.species.toUpperCase()} · ${group.finishCategory.toUpperCase()}${glazeSuffix}${procSuffix}`;
     } else if (group.isolatedDoorStyle) {
@@ -3179,6 +3337,15 @@ function renderFormIntoPdf(doc, group, orderNum, totalOrders) {
       // FSFK: if all lines share one style, show it; else "Sample Front Kit Mix"
       const fsfkStyles = [...new Set(group.lines.map(l => l.doorStyle).filter(Boolean))];
       doorStyleSpec = fsfkStyles.length === 1 ? fsfkStyles[0] : (fsfkStyles.length === 0 ? 'FSFK Sample Front Kits' : 'Sample Front Kit Mix');
+    } else if (group.skuType === 'SFK') {
+      // SFK (Sample Front Kit): same shape as SD — isolation styles force a single label,
+      // otherwise show the unified style or "Sample Front Kit Mix".
+      if (group.isolatedDoorStyle) {
+        doorStyleSpec = group.isolatedDoorStyle;
+      } else {
+        const sfkStyles = [...new Set(group.lines.map(l => l.doorStyle).filter(Boolean))];
+        doorStyleSpec = sfkStyles.length === 1 ? sfkStyles[0] : (sfkStyles.length === 0 ? 'Sample Front Kits' : 'Sample Front Kit Mix');
+      }
     } else {
       // SD: isolation styles always force their own single-style label.
       // Otherwise, if all lines share one door style show it, else "Sample Door Mix".
