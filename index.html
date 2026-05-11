@@ -715,16 +715,15 @@
    Add to these lists as the catalog grows.
    ============================================================ */
 
+// Door styles available for SD (Sample Door) lines. Elite-series door styles
+// are NOT in this list — those are only available on FSFK (Full-Size Sample
+// Front Kits) and live in ELITE_DOOR_STYLES below.
 const DOOR_STYLES = [
   "Aruba","Atlantic Breeze","Atlantis","Ayden","Bella","Bentley","Bentley SRP",
   "Cumberland","Fairmont","Gulfbreeze","Hathaway","Hathaway SRP",
   "Jamestown","Lenoir","Lexington","Madison","Meridian","Meridian SRP",
   "Monterey","Nassau","Newcastle","Oxford","Oxford SRP","Salem",
-  "Sedona","Shreveport","Southporte",
-  // Elite Series
-  "Freeport","Highland","Kimberly","Newton","Sanford","Somerville","Vicksburg",
-  // Additional seen on real orders — confirm these
-  "Tripoli","Alexandria"
+  "Sedona","Shreveport","Southporte"
 ];
 
 const SPECIES = [
@@ -991,6 +990,26 @@ const ELITE_DOOR_STYLES = [
   "Tripoli","Alexandria"
 ];
 
+// Returns the list of valid door styles for a given SKU type.
+//   SD / SFK / CB    -> DOOR_STYLES (Elite styles excluded — Elite is FSFK-only)
+//   FSFK             -> ELITE_DOOR_STYLES only
+// Any other SKU returns an empty array; door style validation is skipped for Parts.
+function validDoorStylesForSku(sku) {
+  const s = (sku || '').toUpperCase().trim();
+  if (s === 'FSFK') return ELITE_DOOR_STYLES;
+  if (s === 'SD' || s === 'SFK' || s === 'CB') return DOOR_STYLES;
+  return [];
+}
+
+// True if `doorStyle` is valid for the given SKU. Empty door styles are
+// considered valid (they're handled by separate "missing field" rules).
+function isValidDoorStyleForSku(sku, doorStyle) {
+  if (!doorStyle) return true;
+  const valid = validDoorStylesForSku(sku);
+  if (valid.length === 0) return true;   // no constraint for Parts
+  return valid.includes(doorStyle);
+}
+
 const FSFK_FRAME_TYPES = [
   { code: 'B', label: 'Beaded (B-)' },
   { code: 'S', label: 'Standard (S-)' }
@@ -1249,6 +1268,11 @@ async function runExtraction() {
         if (!combined.header[k] && aiResult.header[k]) combined.header[k] = aiResult.header[k];
       }
       combined.lineItems.push(...(aiResult.lineItems || []));
+      // Bubble up a non-fatal salvage warning if the JSON was malformed and
+      // we recovered partial results.
+      if (aiResult._salvageWarning) {
+        combined._salvageWarning = aiResult._salvageWarning;
+      }
     }
 
     setProgress(85);
@@ -1264,7 +1288,13 @@ async function runExtraction() {
     state.originalLines = JSON.parse(JSON.stringify(state.lines));
     prefillReviewScreen(combined);
     setProgress(100);
-    setStatus(`Ready for review — ${combined.lineItems.length} lines extracted`);
+    if (combined._salvageWarning) {
+      // Non-fatal partial-extraction notice. Status message stays visible so
+      // the operator knows not all lines made it through.
+      setStatus(`⚠ ${combined._salvageWarning}`);
+    } else {
+      setStatus(`Ready for review — ${combined.lineItems.length} lines extracted`);
+    }
 
     document.getElementById('step2').classList.remove('hidden');
     document.getElementById('step2').scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -1642,8 +1672,9 @@ KIT GROUPING SKUs — SASK: SASK is a "Sample Assortment Kit" — a bundle that 
 - If a line has ONLY "SASK" with no door info at all, then it IS the kit itself — keep sku as "SASK" and treat it as a Part. The tool will price it as a $3,192 kit.
 
 SKU TYPES — IMPORTANT:
-- "SD" = Sample Door. Can use any door style from the main catalog.
-- "FSFK" = Five-Piece Sample Front Kit. Only uses Elite series door styles: ${ELITE_DOOR_STYLES.join(", ")}.
+- "SD" = Sample Door. Can use any door style from the main catalog. ELITE-series door styles (${ELITE_DOOR_STYLES.join(", ")}) are NEVER valid on SD lines — those are FSFK-only. If you see an SD line with one of those door styles, set sku to "FSFK" instead (the dealer mislabeled it).
+- "SFK" = Sample Front Kit. Same door style catalog as SD (Elite NOT allowed).
+- "FSFK" = Full-Size Sample Front Kit. Only uses Elite series door styles: ${ELITE_DOOR_STYLES.join(", ")}.
   FSFK door styles are prefixed with "B-" (Beaded frame) or "S-" (Standard frame). Examples: "B-Vicksburg", "S-Highland Flush", "B-Sanford Beaded".
   When you see a B- or S- prefix on an FSFK line, set "fsfkFrameType" to "B" or "S" and put the door style WITHOUT the prefix in "doorStyle".
   If an FSFK line has no visible B/S prefix, leave fsfkFrameType empty.
@@ -1751,7 +1782,9 @@ Output ONLY valid JSON. No markdown, no prose, no code fences. Exactly this stru
 
   const body = {
     model: "claude-sonnet-4-6",
-    max_tokens: 16000,
+    // 32K tokens handles ~150 detailed line items comfortably. The previous
+    // 16K cap was getting truncated on 80+ line orders.
+    max_tokens: 32000,
     system: systemPrompt,
     messages: [{ role: "user", content }]
   };
@@ -1780,14 +1813,183 @@ Output ONLY valid JSON. No markdown, no prose, no code fences. Exactly this stru
   // strip code fences if the model added them despite instructions
   jsonStr = jsonStr.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '');
 
+  // Strategy 1: straight parse. Works when the AI returns clean JSON.
   try {
     return JSON.parse(jsonStr);
-  } catch (e) {
-    // try to find the JSON object inside
-    const m = jsonStr.match(/\{[\s\S]*\}/);
-    if (m) return JSON.parse(m[0]);
-    throw new Error('Could not parse JSON: ' + e.message);
+  } catch (e1) {
+    // proceed to repair / salvage
   }
+
+  // Strategy 2: extract the outermost JSON object via balanced-brace scan and
+  // attempt to repair common AI mistakes — trailing commas, unterminated trailing
+  // string/object/array if max_tokens cut the response off.
+  const jsonObj = extractOutermostJsonObject(jsonStr);
+  if (jsonObj) {
+    const repaired = repairJsonString(jsonObj);
+    try {
+      return JSON.parse(repaired);
+    } catch (e2) {
+      // fall through to salvage
+    }
+  }
+
+  // Strategy 3: line-by-line salvage. The header may still be valid; the
+  // lineItems array may have one or more corrupted entries. Try to extract
+  // EVERY complete {...} object inside the lineItems array and parse each
+  // independently. Skipped lines get logged so we can show the operator how
+  // many lines were lost. They can add the missing ones manually via "+ Add".
+  const salvaged = salvageJsonLineItems(jsonStr);
+  if (salvaged && salvaged.lineItems && salvaged.lineItems.length > 0) {
+    console.warn(
+      `JSON salvage: recovered ${salvaged.lineItems.length} lines, ` +
+      `${salvaged.skippedCount} lines could not be parsed and need to be added manually.`
+    );
+    // Surface this to the user via a soft warning on the resulting object
+    salvaged._salvageWarning = salvaged.skippedCount > 0
+      ? `The AI returned malformed JSON. ${salvaged.lineItems.length} lines were recovered, but ${salvaged.skippedCount} line(s) could not be parsed — add them manually using "+ Add Line".`
+      : null;
+    return salvaged;
+  }
+
+  throw new Error('Could not parse JSON from the AI response. The order may have been too large — try splitting the upload into smaller batches.');
+}
+
+// Find the outermost balanced { ... } in a string. Tolerant of trailing content
+// after the JSON object (e.g., explanatory text the model accidentally added).
+function extractOutermostJsonObject(s) {
+  const start = s.indexOf('{');
+  if (start === -1) return null;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = start; i < s.length; i++) {
+    const c = s[i];
+    if (inStr) {
+      if (esc) { esc = false; continue; }
+      if (c === '\\') { esc = true; continue; }
+      if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') { inStr = true; continue; }
+    if (c === '{') depth++;
+    else if (c === '}') {
+      depth--;
+      if (depth === 0) return s.slice(start, i + 1);
+    }
+  }
+  // unbalanced — return everything from start to end, let repair try to close it
+  return s.slice(start);
+}
+
+// Repair common AI JSON mistakes:
+//   - trailing commas before } or ]
+//   - unterminated strings (close with " if line ends mid-string)
+//   - missing closing } or ] if truncated by max_tokens
+function repairJsonString(s) {
+  let out = s;
+  // Remove trailing commas before } or ]
+  out = out.replace(/,\s*([}\]])/g, '$1');
+  // If unbalanced, append the missing closers. Walk the string to find depth.
+  let depthObj = 0, depthArr = 0;
+  let inStr = false, esc = false;
+  for (let i = 0; i < out.length; i++) {
+    const c = out[i];
+    if (inStr) {
+      if (esc) { esc = false; continue; }
+      if (c === '\\') { esc = true; continue; }
+      if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') { inStr = true; continue; }
+    if (c === '{') depthObj++;
+    else if (c === '}') depthObj--;
+    else if (c === '[') depthArr++;
+    else if (c === ']') depthArr--;
+  }
+  // If we ended inside a string, close it
+  if (inStr) out += '"';
+  // Close unbalanced array/object brackets in reverse order
+  while (depthArr-- > 0) out += ']';
+  while (depthObj-- > 0) out += '}';
+  return out;
+}
+
+// Salvage strategy: pull the header (first portion before lineItems) and then
+// individually parse each {...} block inside the lineItems array. Skip blocks
+// that can't be parsed. Returns { header, lineItems, skippedCount }.
+function salvageJsonLineItems(s) {
+  // Find the lineItems array start
+  const liIdx = s.search(/"lineItems"\s*:\s*\[/);
+  if (liIdx === -1) return null;
+  const arrStart = s.indexOf('[', liIdx);
+  if (arrStart === -1) return null;
+
+  // Parse the header chunk (everything before "lineItems": and close it)
+  let header = {};
+  try {
+    const beforeArr = s.slice(0, liIdx).replace(/,\s*$/, '');
+    const headerJson = beforeArr + '}';   // close the outer object
+    const parsed = JSON.parse(headerJson);
+    header = parsed.header || parsed;
+  } catch {
+    // header parse failed — keep header empty and continue
+  }
+
+  // Walk through the lineItems array, balanced-brace-scan each {...} block
+  const lineItems = [];
+  let skippedCount = 0;
+  let i = arrStart + 1;
+  while (i < s.length) {
+    // Skip whitespace, commas, and the closing ]
+    while (i < s.length && /[\s,]/.test(s[i])) i++;
+    if (i >= s.length) break;
+    if (s[i] === ']') break;
+    if (s[i] !== '{') { i++; continue; }
+
+    // Find the matching close brace for this object
+    let depth = 0;
+    let inStr = false, esc = false;
+    let objEnd = -1;
+    for (let j = i; j < s.length; j++) {
+      const c = s[j];
+      if (inStr) {
+        if (esc) { esc = false; continue; }
+        if (c === '\\') { esc = true; continue; }
+        if (c === '"') inStr = false;
+        continue;
+      }
+      if (c === '"') { inStr = true; continue; }
+      if (c === '{') depth++;
+      else if (c === '}') {
+        depth--;
+        if (depth === 0) { objEnd = j; break; }
+      }
+    }
+    if (objEnd === -1) {
+      // Truncated last object — try to repair and parse
+      const slice = s.slice(i);
+      const repaired = repairJsonString(slice);
+      try {
+        lineItems.push(JSON.parse(repaired));
+      } catch {
+        skippedCount++;
+      }
+      break;
+    }
+    const objStr = s.slice(i, objEnd + 1);
+    try {
+      lineItems.push(JSON.parse(objStr));
+    } catch {
+      // Try to repair this single object
+      try {
+        lineItems.push(JSON.parse(repairJsonString(objStr)));
+      } catch {
+        skippedCount++;
+      }
+    }
+    i = objEnd + 1;
+  }
+  return { header, lineItems, skippedCount };
 }
 
 /* ============================================================
@@ -2034,7 +2236,7 @@ function prefillReviewScreen(extracted) {
     if (!sku) state.flags.add(i);
     if (!isPart && (!l.species || !l.finishName)) state.flags.add(i);
     // door style not in known list (warning only) — skip for parts
-    if (!isPart && l.doorStyle && !DOOR_STYLES.includes(l.doorStyle)) state.flags.add(i);
+    if (!isPart && !isValidDoorStyleForSku(l.sku, l.doorStyle)) state.flags.add(i);
     // Combo validation: door style × species × finish category
     if (!isPart) {
       const finishCat = inferFinishCategoryFromLine(l);
@@ -2072,8 +2274,15 @@ function getFlagReasons(line) {
   if (!isPart) {
     if (!line.species) reasons.push('Missing Species — pick from the dropdown (this is a splitter)');
     if (!line.finishName) reasons.push('Missing Finish — pick from the dropdown (this is a splitter)');
-    if (line.doorStyle && !DOOR_STYLES.includes(line.doorStyle)) {
-      reasons.push(`Door Style "${line.doorStyle}" isn't in the catalog — pick the closest match or correct the name`);
+    if (line.doorStyle && !isValidDoorStyleForSku(line.sku, line.doorStyle)) {
+      const sku = (line.sku || '').toUpperCase();
+      if (sku === 'FSFK') {
+        reasons.push(`Door Style "${line.doorStyle}" isn't an Elite door style — FSFK only uses Elite styles (${ELITE_DOOR_STYLES.join(', ')})`);
+      } else if (ELITE_DOOR_STYLES.includes(line.doorStyle)) {
+        reasons.push(`Door Style "${line.doorStyle}" is Elite-only and not available on ${sku || 'SD'} — change SKU to FSFK, or pick a non-Elite door style`);
+      } else {
+        reasons.push(`Door Style "${line.doorStyle}" isn't in the catalog — pick the closest match or correct the name`);
+      }
     }
     // Cross-field combination validation — door style × species × finish category
     const finishCat = inferFinishCategoryFromLine(line);
@@ -2118,7 +2327,7 @@ function getFlagFields(line) {
   if (!isPart) {
     if (!line.species) fields.add('species');
     if (!line.finishName) fields.add('finish');
-    if (line.doorStyle && !DOOR_STYLES.includes(line.doorStyle)) fields.add('doorStyle');
+    if (line.doorStyle && !isValidDoorStyleForSku(line.sku, line.doorStyle)) fields.add('doorStyle');
     // Combo violation — highlight door style + species + finish so the user
     // can immediately see the three fields that need to harmonize.
     const finishCat = inferFinishCategoryFromLine(line);
@@ -2434,7 +2643,7 @@ function onLineFieldChange(e) {
   const nowFlag = !line.isNonDoor && !line.approved && (
     !skuUp
     || (!isPart && (!line.species || !line.finishName))
-    || (!isPart && line.doorStyle && !DOOR_STYLES.includes(line.doorStyle))
+    || (!isPart && !isValidDoorStyleForSku(line.sku, line.doorStyle))
     || !!comboViolation
   );
   if (nowFlag) state.flags.add(idx); else state.flags.delete(idx);
@@ -2485,7 +2694,7 @@ function onLineAction(e) {
       const isPart = sku && sku !== 'SD' && sku !== 'SFK' && sku !== 'FSFK';
       if (!sku) state.flags.add(i);
       if (!isPart && (!l.species || !l.finishName)) state.flags.add(i);
-      if (!isPart && l.doorStyle && !DOOR_STYLES.includes(l.doorStyle)) state.flags.add(i);
+      if (!isPart && !isValidDoorStyleForSku(l.sku, l.doorStyle)) state.flags.add(i);
       if (!isPart) {
         const finishCat = inferFinishCategoryFromLine(l);
         if (validateDoorSpeciesFinish(l.doorStyle, l.species, finishCat, l.finishName)) state.flags.add(i);
@@ -2507,7 +2716,7 @@ function onLineAction(e) {
         if (l.confidence === 'low') shouldFlag = true;
         if (!sku) shouldFlag = true;
         if (!isPart && (!l.species || !l.finishName)) shouldFlag = true;
-        if (!isPart && l.doorStyle && !DOOR_STYLES.includes(l.doorStyle)) shouldFlag = true;
+        if (!isPart && !isValidDoorStyleForSku(l.sku, l.doorStyle)) shouldFlag = true;
         if (!isPart) {
           const finishCat = inferFinishCategoryFromLine(l);
           if (validateDoorSpeciesFinish(l.doorStyle, l.species, finishCat, l.finishName)) shouldFlag = true;
